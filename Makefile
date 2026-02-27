@@ -114,12 +114,12 @@ type-check:
 
 scrape:
 	@echo "Running pico.css docs scraper..."
-	uv run python -m pico_doc_scraper
+	uv run python -m pico_doc_scraper.browser_scraper
 
 scrape-retry:
 	@echo "Retrying failed URLs..."
-	uv run python -m pico_doc_scraper --retry
+	uv run python -m pico_doc_scraper.browser_scraper --retry
 
 scrape-fresh:
 	@echo "Starting fresh scrape (clearing all state)..."
-	uv run python -m pico_doc_scraper --force-fresh
+	uv run python -m pico_doc_scraper.browser_scraper --force-fresh

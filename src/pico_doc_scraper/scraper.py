@@ -1,6 +1,7 @@
 """Main scraping logic for pico.css documentation."""
 
 import time
+from collections.abc import Callable
 from urllib.parse import urljoin, urlparse
 
 import click
@@ -85,6 +86,65 @@ def discover_doc_links(html: str, base_url: str) -> set[str]:
     return links
 
 
+def _extract_code_blocks(soup) -> list[tuple[str, str, str]]:
+    """Extract code blocks before markdown conversion.
+
+    Returns:
+        List of tuples: (placeholder_id, language, code_content)
+    """
+    from bs4 import BeautifulSoup as BS
+
+    code_blocks = []
+
+    # Find all <pre> tags that contain <code>
+    for idx, pre_tag in enumerate(soup.find_all("pre")):
+        code_tag = pre_tag.find("code")
+        if code_tag:
+            # Extract language from code tag class (e.g., "language-html")
+            code_classes = code_tag.get("class", [])
+            language = "html"  # default
+            for cls in code_classes:
+                if isinstance(cls, str) and cls.startswith("language-"):
+                    language = cls.replace("language-", "")
+                    break
+
+            # Get the clean code text (removes syntax highlighting spans)
+            code_text = code_tag.get_text()
+
+            # Create a unique placeholder
+            placeholder = f"|||CODEBLOCK{idx}|||"
+
+            # Replace the <pre> tag with a placeholder paragraph
+            # We need to create a new soup fragment for the placeholder
+            placeholder_html = f"<p><strong>{placeholder}</strong></p>"
+            placeholder_soup = BS(placeholder_html, "html.parser")
+            placeholder_tag = placeholder_soup.p
+            pre_tag.replace_with(placeholder_tag)
+
+            code_blocks.append((placeholder, language, code_text))
+
+    return code_blocks
+
+
+def _restore_code_blocks(markdown: str, code_blocks: list[tuple[str, str, str]]) -> str:
+    """Restore code blocks into the markdown content.
+
+    Args:
+        markdown: Markdown content with placeholders
+        code_blocks: List of (placeholder_id, language, code_content) tuples
+
+    Returns:
+        Markdown with code blocks restored as fenced code blocks
+    """
+    result = markdown
+    for placeholder, language, code_text in code_blocks:
+        fenced_block = f"\n```{language}\n{code_text}\n```\n"
+        # The placeholder might be wrapped in ** markers from <strong> tags
+        result = result.replace(f"**{placeholder}**", fenced_block)
+        result = result.replace(placeholder, fenced_block)
+    return result
+
+
 def parse_documentation(html: str) -> dict:
     """Parse documentation page and extract relevant content.
 
@@ -123,15 +183,33 @@ def parse_documentation(html: str) -> dict:
         main_content = soup.find("body") or soup
 
     # Remove navigation, footer, and other non-content elements
-    for tag in main_content.find_all(["nav", "footer", "header"]):
+    # BUT preserve <footer class="code"> which contains code examples
+    for tag in main_content.find_all(["nav", "header"]):
         tag.decompose()
+
+    # Remove footers that are NOT code examples
+    for tag in main_content.find_all("footer"):
+        classes = tag.get("class")
+        if not classes or "code" not in classes:
+            tag.decompose()
 
     # Remove common navigation classes
     for tag in main_content.find_all(class_=["navigation", "sidebar", "toc", "breadcrumb"]):
         tag.decompose()
 
-    # Convert to markdown
-    markdown_content = md(str(main_content), heading_style="ATX")
+    # Extract code blocks before markdown conversion (they'll be restored after)
+    code_blocks = _extract_code_blocks(main_content)
+
+    # Convert to markdown with code-friendly settings
+    markdown_content = md(
+        str(main_content),
+        heading_style="ATX",
+        code_language="html",
+        strip=[],
+    )
+
+    # Restore code blocks as fenced code blocks
+    markdown_content = _restore_code_blocks(markdown_content, code_blocks)
 
     result = {
         "title": title,
@@ -142,19 +220,24 @@ def parse_documentation(html: str) -> dict:
     return result
 
 
-def process_single_page(url: str, visited_urls: set[str]) -> tuple[bool, dict | None, list[str]]:
-    """Process a single page: fetch, parse, save.
+def process_single_page(
+    url: str,
+    visited_urls: set[str],
+    fetch_func: Callable[[str], str] = fetch_page,
+) -> tuple[bool, dict | None, list[str]]:
+    """Process a single page: fetch, parse, save using the provided fetch function.
 
     Args:
         url: URL to process
         visited_urls: Set of already visited URLs
+        fetch_func: Function to use for fetching the page HTML (default: fetch_page)
 
     Returns:
         Tuple of (success, parsed_data, discovered_links)
     """
     try:
         # Fetch the page
-        html = fetch_page(url)
+        html = fetch_func(url)
         print("  ✓ Fetched")
 
         # Parse the content
@@ -358,6 +441,32 @@ def scrape_docs(retry_mode: bool = False, force_fresh: bool = False) -> None:
         print_summary(page_count, error_count, errors, failed_urls)
 
 
+def scrape_single_target(url: str) -> None:
+    """Scrape a single target URL for testing purposes.
+
+    Args:
+        url: The URL to scrape
+    """
+    # Ensure output directories exist
+    ensure_output_dir(settings.OUTPUT_DIR)
+    ensure_output_dir(settings.DATA_DIR)
+
+    print(f"Fetching: {url}")
+
+    try:
+        success, parsed, _ = process_single_page(url, set())
+
+        if success and parsed:
+            print("\n✓ Successfully scraped target URL")
+            print(f"  Title: {parsed['title']}")
+            print(f"  Output: {settings.OUTPUT_DIR}")
+        else:
+            print("\n✗ Failed to scrape target URL")
+
+    except Exception as e:
+        print(f"\n✗ Error: {e}")
+
+
 @click.command()
 @click.option(
     "--retry",
@@ -371,7 +480,14 @@ def scrape_docs(retry_mode: bool = False, force_fresh: bool = False) -> None:
     is_flag=True,
     help="Start a fresh scrape, clearing all existing state",
 )
-def main(retry: bool, force_fresh: bool) -> None:
+@click.option(
+    "--target",
+    "-t",
+    type=str,
+    default=None,
+    help="Scrape a single target URL for testing (forces fresh, no state tracking)",
+)
+def main(retry: bool, force_fresh: bool, target: str | None) -> None:
     """Pico.css Documentation Scraper.
 
     Scrapes documentation from picocss.com and converts it to markdown.
@@ -381,7 +497,12 @@ def main(retry: bool, force_fresh: bool) -> None:
     print("Pico.css Documentation Scraper")
     print("=" * 60)
 
-    scrape_docs(retry_mode=retry, force_fresh=force_fresh)
+    if target:
+        print(f"\n🎯 TARGET MODE: Scraping single URL: {target}")
+        print("(State tracking disabled)\n")
+        scrape_single_target(target)
+    else:
+        scrape_docs(retry_mode=retry, force_fresh=force_fresh)
 
     print("\nScraping complete!")
 
